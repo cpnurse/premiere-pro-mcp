@@ -608,6 +608,14 @@ export function getUtilityTools(bridgeOptions: BridgeOptions) {
         if (![args.width, args.height].every((v) => Number.isInteger(v) && v >= 16 && v <= 16384)) {
           return { success: false, error: "width and height must be integers from 16 to 16384 pixels" };
         }
+        // Premiere 26.5 clamps frame height to 8192 but getSettings() keeps reporting the
+        // requested height, so the read-back below cannot catch it (measured 2026-10-02).
+        if (args.height > 8192) {
+          return {
+            success: false,
+            error: `Premiere caps sequence frame height at 8192; ${args.width}x${args.height} would be silently clamped while still reading back as requested. No mutation was attempted.`,
+          };
+        }
         const script = buildToolScript(`
           var seq = app.project.activeSequence;
           if (!seq) return __error("No active sequence");
