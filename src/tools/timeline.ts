@@ -3,6 +3,76 @@ import { sendCommand, BridgeOptions } from "../bridge/file-bridge.js";
 
 export function getTimelineTools(bridgeOptions: BridgeOptions) {
   return {
+    place_still_at_length: {
+      description:
+        "Place a still (or any item) on a video track at a chosen length in one call: temporarily sets the project item's in/out to the length, inserts it, then restores the item's original in/out. Use when trim_clip cannot lengthen placed clips (Premiere 26.x).",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          item_id: { type: "string", description: "Node ID or name of the project item" },
+          duration_seconds: { type: "number", description: "Length of the placed clip in seconds" },
+          track_index: { type: "number", description: "Video track index (0-based, default 0)" },
+          start_seconds: { type: "number", description: "Timeline start in seconds (default 0)" },
+        },
+        required: ["item_id", "duration_seconds"],
+      },
+      handler: async (args: { item_id: string; duration_seconds: number; track_index?: number; start_seconds?: number }) => {
+        const trackIndex = args.track_index ?? 0;
+        const startSeconds = args.start_seconds ?? 0;
+        const duration = args.duration_seconds;
+        if (!Number.isFinite(duration) || duration <= 0 || !Number.isInteger(trackIndex) || trackIndex < 0 ||
+            !Number.isFinite(startSeconds) || startSeconds < 0) {
+          return {
+            success: false,
+            error: "place_still_at_length needs duration_seconds > 0, a non-negative integer track_index and start_seconds >= 0. No mutation was attempted.",
+          };
+        }
+
+        const script = buildToolScript(`
+          var seq = app.project.activeSequence;
+          if (!seq) return __error("No active sequence");
+          var track = seq.videoTracks[${trackIndex}];
+          if (!track) return __error("Video track index ${trackIndex} is out of range");
+          var item = __findProjectItem("${escapeForExtendScript(args.item_id)}");
+          if (!item) return __error("Project item not found: ${escapeForExtendScript(args.item_id)}");
+
+          var savedIn = item.getInPoint().ticks;
+          var savedOut = item.getOutPoint().ticks;
+          var before = {};
+          var i;
+          for (i = 0; i < track.clips.numItems; i++) before[track.clips[i].nodeId] = true;
+
+          var placed = null;
+          try {
+            // Pad half a frame so Premiere's frame rounding can't drop the last frame.
+            var frameSeconds = __ticksToSeconds(parseFloat(seq.timebase));
+            item.setInPoint("0", 4);
+            item.setOutPoint(__secondsToTicks(${duration} + frameSeconds / 2).toString(), 4);
+            seq.insertClip(item, __secondsToTicks(${startSeconds}).toString(), ${trackIndex}, 0);
+            for (i = 0; i < track.clips.numItems; i++) {
+              var c = track.clips[i];
+              if (!before[c.nodeId] && c.projectItem && c.projectItem.nodeId === item.nodeId) { placed = c; break; }
+            }
+          } finally {
+            item.setInPoint(savedIn, 4);
+            item.setOutPoint(savedOut, 4);
+          }
+          if (!placed) return __error("Premiere did not add the item to video track ${trackIndex}; the item's in/out was restored.");
+
+          return __result({
+            placed: true,
+            nodeId: placed.nodeId,
+            item: item.name,
+            trackIndex: ${trackIndex},
+            startSeconds: __ticksToSeconds(placed.start.ticks),
+            durationSeconds: __ticksToSeconds(placed.end.ticks) - __ticksToSeconds(placed.start.ticks),
+            restored: true
+          });
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
     add_to_timeline: {
       description:
         "Insert a project item at a timeline position and verify Premiere added no unexpected same-track fragments.",
