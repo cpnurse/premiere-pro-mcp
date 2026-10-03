@@ -300,6 +300,19 @@ export function getUtilityTools(bridgeOptions: BridgeOptions) {
         required: ["width", "height"],
       },
       handler: async (args: { width: number; height: number }) => {
+        // Premiere clamps frame height to 8192 (measured on 26.5) but the scripting API
+        // keeps reporting the requested value, so the clamp is invisible afterwards.
+        // 16384 wide is Adobe's documented maximum.
+        const { width, height } = args;
+        if (![width, height].every((n) => Number.isInteger(n) && n > 0)) {
+          return { success: false, error: "set_sequence_resolution needs positive whole-pixel width and height. No mutation was attempted." };
+        }
+        if (height > 8192 || width > 16384) {
+          return {
+            success: false,
+            error: `Premiere caps sequence frames at 16384x8192; ${width}x${height} would be silently clamped while still reading back as requested. No mutation was attempted.`,
+          };
+        }
         const script = buildToolScript(`
           var seq = app.project.activeSequence;
           if (!seq) return __error("No active sequence");
@@ -307,11 +320,16 @@ export function getUtilityTools(bridgeOptions: BridgeOptions) {
           var settings = seq.getSettings();
           if (!settings) return __error("Could not get sequence settings");
 
-          settings.videoFrameWidth = ${args.width};
-          settings.videoFrameHeight = ${args.height};
+          settings.videoFrameWidth = ${width};
+          settings.videoFrameHeight = ${height};
           seq.setSettings(settings);
 
-          return __result({ width: ${args.width}, height: ${args.height}, sequence: seq.name });
+          var gotW = seq.getSettings().videoFrameWidth;
+          var gotH = seq.getSettings().videoFrameHeight;
+          if (gotW != ${width} || gotH != ${height}) {
+            return __error("Premiere did not apply ${width}x${height}; it reports " + gotW + "x" + gotH + ".");
+          }
+          return __result({ width: gotW, height: gotH, sequence: seq.name });
         `);
         return sendCommand(script, bridgeOptions);
       },
