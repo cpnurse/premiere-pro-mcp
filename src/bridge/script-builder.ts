@@ -199,9 +199,16 @@ function __collectEprFiles(folder, out) {
 
 // macOS applications are bundles: AME/Premiere resources live below Contents,
 // whereas the Windows installers put the same folders directly below the app root.
+// On macOS /Applications/<App> is usually an install folder holding <App>.app, so
+// step into the bundle when we were handed the folder around it.
 function __adobeApplicationResourceFolder(appFolder, relativePath) {
-  var prefix = appFolder.fsName + (__isMacOS() ? "/Contents/" : "/");
-  return new Folder(prefix + relativePath);
+  if (!__isMacOS()) return new Folder(appFolder.fsName + "/" + relativePath);
+  var root = appFolder.fsName;
+  if (!/\\.app$/i.test(root)) {
+    var bundle = new Folder(root + "/" + appFolder.displayName + ".app");
+    if (bundle.exists) root = bundle.fsName;
+  }
+  return new Folder(root + "/Contents/" + relativePath);
 }
 
 // All export presets AME ships, plus the user's own saved presets.
