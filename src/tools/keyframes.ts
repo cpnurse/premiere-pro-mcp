@@ -345,20 +345,44 @@ export function getKeyframeTools(bridgeOptions: BridgeOptions) {
           },
           value: {
             type: "number",
-            description: "Value at the keyframe",
+            description: "Value at the keyframe, for single-value properties (Scale, Rotation, Opacity). Give exactly one of value or point.",
+          },
+          point: {
+            type: "array",
+            items: { type: "number" },
+            description: "[x, y] for two-value properties such as Motion Position or Anchor Point (normalized 0-1 frame coordinates). Give exactly one of value or point.",
           },
         },
-        required: ["node_id", "effect_name", "property_name", "time_seconds", "value"],
+        required: ["node_id", "effect_name", "property_name", "time_seconds"],
       },
       handler: async (args: {
         node_id: string;
         effect_name: string;
         property_name: string;
         time_seconds: number;
-        value: number;
+        value?: number;
+        point?: unknown[];
       }) => {
-        const invalid = keyframeArgumentError(args, ["time_seconds"], "value");
+        const invalid = keyframeArgumentError(args, ["time_seconds"]);
         if (invalid) return { success: false, error: invalid };
+        // A number interpolated into setValueAtKey cannot express Position; an [x, y]
+        // literal can. Validate here so a malformed value never reaches Premiere.
+        if ((args.value === undefined) === (args.point === undefined)) {
+          return { success: false, error: "add_keyframe requires exactly one of value or point. No mutation was attempted." };
+        }
+        let literal: string;
+        if (args.point !== undefined) {
+          const pt = args.point;
+          if (pt.length !== 2 || !pt.every((n) => typeof n === "number" && Number.isFinite(n))) {
+            return { success: false, error: "add_keyframe point must be [x, y] with two finite numbers. No mutation was attempted." };
+          }
+          literal = `[${pt[0]}, ${pt[1]}]`;
+        } else {
+          if (typeof args.value !== "number" || !Number.isFinite(args.value)) {
+            return { success: false, error: "value must be a finite number. No mutation was attempted." };
+          }
+          literal = String(args.value);
+        }
         const script = buildToolScript(`
           var result = __findClip("${escapeForExtendScript(args.node_id)}");
           if (!result) return __error("Clip not found");
@@ -401,14 +425,19 @@ export function getKeyframeTools(bridgeOptions: BridgeOptions) {
 
           var time = __clipKeyTime(keyBase, ${args.time_seconds});
           prop.addKey(time);
-          prop.setValueAtKey(time, ${args.value}, true);
+          var expected = ${literal};
+          prop.setValueAtKey(time, ${literal}, true);
           var readBack = null;
           try { readBack = prop.getValueAtKey(time); } catch(eReadBack) {}
           if (readBack === null || readBack === undefined) {
             return __error("Premiere did not return the keyframe value after writing it; storage is not reported as verified.");
           }
-          if (typeof readBack === "number" && Math.abs(readBack - ${args.value}) > 0.0001) {
-            return __error("Premiere returned " + readBack + " after writing keyframe value ${args.value}; storage is not reported as verified.");
+          if (typeof expected === "number" && typeof readBack === "number" && Math.abs(readBack - expected) > 0.0001) {
+            return __error("Premiere returned " + readBack + " after writing keyframe value " + expected + "; storage is not reported as verified.");
+          }
+          if (typeof expected !== "number" && (readBack.length !== 2 ||
+              Math.abs(readBack[0] - expected[0]) > 0.0001 || Math.abs(readBack[1] - expected[1]) > 0.0001)) {
+            return __error("Premiere returned " + readBack + " after writing keyframe point " + expected + "; storage is not reported as verified.");
           }
           
           return __result({
@@ -420,7 +449,7 @@ export function getKeyframeTools(bridgeOptions: BridgeOptions) {
             property: "${escapeForExtendScript(args.property_name)}",
             time: ${args.time_seconds},
             mediaSeconds: __ticksToSeconds(time.ticks),
-            value: ${args.value},
+            value: expected,
             readBackValue: readBack,
             keyframesOutsideVisibleRange: outsideVisibleRange === null ? null : (outsideVisibleRange ? 1 : 0),
             warning: outsideVisibleRange === true
