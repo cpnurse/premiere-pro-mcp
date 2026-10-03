@@ -54,6 +54,39 @@ function keyBaseScript(times: Array<[string, number]>): string {
             .join("\n          ")}`;
 }
 
+export type EaseKind = "in" | "out" | "in_out";
+type KeyValue = number | number[];
+
+/**
+ * Premiere's scripting API can set a keyframe's interpolation type but not its ease
+ * handles, so an eased move is approximated with closely spaced linear keyframes
+ * that follow a power curve. strength 1 = linear; 2-3 reads as a natural ease.
+ */
+export function easedKeyframes(opts: {
+  start: number; end: number; from: KeyValue; to: KeyValue; ease: EaseKind; strength: number; steps: number;
+}): { t: number; v: KeyValue }[] {
+  const { start, end, from, to, ease, strength: p, steps } = opts;
+  const curve = (x: number) =>
+    ease === "in" ? x ** p
+    : ease === "out" ? 1 - (1 - x) ** p
+    : x < 0.5 ? 0.5 * (2 * x) ** p : 1 - 0.5 * (2 - 2 * x) ** p;
+  const lerp = (a: number, b: number, e: number) => a + (b - a) * e;
+  const keys: { t: number; v: KeyValue }[] = [];
+  for (let i = 0; i <= steps; i++) {
+    if (i === 0) { keys.push({ t: start, v: from }); continue; }
+    if (i === steps) { keys.push({ t: end, v: to }); continue; }
+    const x = i / steps;
+    const e = curve(x);
+    const v = Array.isArray(from) ? from.map((a, j) => lerp(a, (to as number[])[j], e)) : lerp(from, to as number, e);
+    keys.push({ t: lerp(start, end, x), v });
+  }
+  return keys;
+}
+
+const isPoint = (v: unknown): v is number[] =>
+  Array.isArray(v) && v.length === 2 && v.every((n) => typeof n === "number" && Number.isFinite(n));
+const isScalar = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
 export function getKeyframeTools(bridgeOptions: BridgeOptions) {
   return {
     get_effect_properties: {
@@ -455,6 +488,81 @@ export function getKeyframeTools(bridgeOptions: BridgeOptions) {
             warning: outsideVisibleRange === true
               ? "The keyframe was stored outside the clip's visible range and will not appear during this clip. It may block later trims; inspect the clip before relying on it."
               : (outsideVisibleRange === null ? "The clip's visible range could not be read, so keyframe visibility is unverified." : null)
+          });
+        `);
+        return sendCommand(script, bridgeOptions);
+      },
+    },
+
+    add_eased_move: {
+      description:
+        "Animate a property from one value to another with a real ease in/out, in one call. Writes closely spaced linear keyframes along an ease curve (Premiere's scripting API cannot set ease handles). Replaces existing keyframes between start and end. Use point arrays [x, y] for Position/Anchor Point.",
+      parameters: {
+        type: "object" as const,
+        properties: {
+          node_id: { type: "string", description: "Node ID of the clip" },
+          effect_name: { type: "string", description: "Display name of the effect, e.g. 'Motion'" },
+          property_name: { type: "string", description: "Display name of the property, e.g. 'Position' or 'Scale'" },
+          start_seconds: { type: "number", description: "Start of the move, seconds relative to clip start" },
+          end_seconds: { type: "number", description: "End of the move, seconds relative to clip start" },
+          from: { type: "number", description: "Start value for single-value properties (Scale, Rotation, Opacity)" },
+          to: { type: "number", description: "End value for single-value properties" },
+          from_point: { type: "array", items: { type: "number" }, description: "Start [x, y] for Position/Anchor Point (normalized 0-1)" },
+          to_point: { type: "array", items: { type: "number" }, description: "End [x, y] for Position/Anchor Point" },
+          ease: { type: "string", enum: ["in", "out", "in_out"], description: "Which ends ease (default in_out)" },
+          strength: { type: "number", description: "1 = linear, 2 = gentle (default), 3+ = strong" },
+          steps: { type: "number", description: "Number of segments, 2-60 (default 12)" },
+        },
+        required: ["node_id", "effect_name", "property_name", "start_seconds", "end_seconds"],
+      },
+      handler: async (args: {
+        node_id: string; effect_name: string; property_name: string; start_seconds: number; end_seconds: number;
+        from?: unknown; to?: unknown; from_point?: unknown; to_point?: unknown;
+        ease?: EaseKind; strength?: number; steps?: number;
+      }) => {
+        const scalarPair = args.from !== undefined || args.to !== undefined;
+        const pointPair = args.from_point !== undefined || args.to_point !== undefined;
+        const from = scalarPair ? args.from : args.from_point;
+        const to = scalarPair ? args.to : args.to_point;
+        const shapesOk = scalarPair !== pointPair &&
+          ((isPoint(from) && isPoint(to)) || (isScalar(from) && isScalar(to)));
+        if (!shapesOk) {
+          return { success: false, error: "add_eased_move needs either from/to (numbers) or from_point/to_point ([x, y]), not both. No mutation was attempted." };
+        }
+        if (!isScalar(args.start_seconds) || !isScalar(args.end_seconds) || args.start_seconds < 0 || args.end_seconds <= args.start_seconds) {
+          return { success: false, error: "add_eased_move needs 0 <= start_seconds < end_seconds. No mutation was attempted." };
+        }
+        const steps = Math.min(60, Math.max(2, Math.round(args.steps ?? 12)));
+        const strength = isScalar(args.strength) && args.strength >= 1 ? args.strength : 2;
+        const keys = easedKeyframes({
+          start: args.start_seconds, end: args.end_seconds, from: from as KeyValue, to: to as KeyValue,
+          ease: args.ease ?? "in_out", strength, steps,
+        });
+        const lit = (v: KeyValue) => (Array.isArray(v) ? `[${v[0]}, ${v[1]}]` : String(v));
+        const keyList = keys.map((k) => `{ t: ${k.t}, v: ${lit(k.v)} }`).join(",\n            ");
+
+        const script = buildToolScript(`
+${propertyLookupScript(args)}
+          ${keyBaseScript([["start_seconds", args.start_seconds], ["end_seconds", args.end_seconds]])}
+
+          var keys = [
+            ${keyList}
+          ];
+          var toTime = function(s) { return __clipKeyTime(keyBase, s); };
+          if (!prop.isTimeVarying()) prop.setTimeVarying(true);
+          else { try { prop.removeKeyRange(toTime(keys[0].t), toTime(keys[keys.length - 1].t), true); } catch (eRange) {} }
+          for (var k = 0; k < keys.length; k++) {
+            var tm = toTime(keys[k].t);
+            prop.addKey(tm);
+            prop.setValueAtKey(tm, keys[k].v, true);
+            try { prop.setInterpolationTypeAtKey(tm, 0, true); } catch (eInterp) {}
+          }
+          var last = keys[keys.length - 1];
+          var readBack = prop.getValueAtKey(toTime(last.t));
+          return __result({
+            keyframes: keys.length, start: keys[0].t, end: last.t, endValue: last.v, readBackEndValue: readBack,
+            renderVerified: false,
+            verificationScope: "Premiere parameter readback only; verify playback before relying on visual output."
           });
         `);
         return sendCommand(script, bridgeOptions);
